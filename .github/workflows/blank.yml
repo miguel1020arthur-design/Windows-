@@ -1,128 +1,186 @@
-
-
-content = r'''name: Titan Cloud PC - Mobile RDP + Tailscale
+name: RDP + Roblox
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  windows-pc:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 3600
 
     steps:
-      - name: Prepare Windows, RDP account and Tailscale
+      - name: Configure RDP
         shell: powershell
-        env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
 
-          Write-Host "=== Titan Cloud PC starting ==="
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $username = "RDP"
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $numbers = [char[]](48..57)
+          $special = [char[]](33..47)
+          $passwordChars = @()
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Validate required secrets before making changes.
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Missing TS_AUTHKEY. Add it in Repository Settings > Secrets and variables > Actions."
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Missing RDP_PASSWORD. Add a strong password in Repository Settings > Secrets and variables > Actions."
-          }
-
-          if ($env:RDP_PASSWORD.Length -lt 12) {
-            throw "RDP_PASSWORD must be at least 12 characters long."
-          }
-
-          # Create or update the dedicated RDP user.
-          $username = "CloudUser"
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
           if ($existingUser) {
-            Set-LocalUser -Name $username -Password $securePassword
-            Enable-LocalUser -Name $username
-            Write-Host "Updated existing RDP account."
+              Set-LocalUser -Name $username -Password $securePassword
           } else {
-            New-LocalUser -Name $username `
-              -Password $securePassword `
-              -Description "Titan Cloud PC remote desktop account" `
-              -PasswordNeverExpires
-            Write-Host "Created RDP account."
+              New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
           }
 
-          # Grant standard Remote Desktop access; do not make this user an administrator.
-          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
-          Add-LocalGroupMember -Group $rdpGroup.Name -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
-          # Enable Remote Desktop and the built-in firewall rules.
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
 
-          # Download and install Tailscale.
-          $installer = Join-Path $env:TEMP "tailscale-setup.exe"
-          Write-Host "Downloading Tailscale..."
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
-            -OutFile $installer
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          Start-Sleep -Seconds 10
 
-          Write-Host "Installing Tailscale..."
-          $install = Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait -PassThru
-          if ($install.ExitCode -ne 0) {
-            throw "Tailscale installer returned exit code $($install.ExitCode)."
+          $tsIP = $null
+          for ($i = 1; $i -le 20; $i++) {
+              $tsIP = (& $tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
           }
 
-          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (!(Test-Path $tailscaleExe)) {
-            throw "Tailscale executable was not found after installation."
+          if (-not $tsIP) {
+              Write-Error "Não foi possível obter o IP do Tailscale."
+              exit 1
           }
 
-          # Authenticate this temporary runner to the user's tailnet.
-          # Use a one-off/ephemeral key where supported, and never print the key.
-          Write-Host "Connecting to Tailscale..."
-          & $tailscaleExe up "--auth-key=$env:TS_AUTHKEY" "--hostname=titan-cloud-pc"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed. Check TS_AUTHKEY, key expiry, and tailnet policy."
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 5
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if ($result.TcpTestSucceeded) {
+              Write-Host "RDP funcionando."
+          } else {
+              Write-Warning "A porta RDP ainda não respondeu."
           }
 
-          Start-Sleep -Seconds 8
+      - name: Install Roblox
+        shell: powershell
+        run: |
+          $robloxInstaller = "$env:TEMP\RobloxPlayerLauncher.exe"
+          $robloxUrl = "https://setup.rbxcdn.com/RobloxPlayerLauncher.exe"
 
-          $ip = (& $tailscaleExe ip -4 | Select-Object -First 1).Trim()
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "No Tailscale IPv4 address was returned."
+          try {
+              Invoke-WebRequest -Uri $robloxUrl -OutFile $robloxInstaller -UseBasicParsing
+              Start-Process -FilePath $robloxInstaller -ArgumentList "-install" -Wait
+              Write-Host "Instalação do Roblox concluída."
+          } catch {
+              Write-Warning "Não foi possível instalar o Roblox."
+              Write-Warning $_
           }
 
-          # Confirm the Remote Desktop service is running.
-          Set-Service -Name TermService -StartupType Manual
-          Start-Service -Name TermService
-          $service = Get-Service -Name TermService
-          if ($service.Status -ne "Running") {
-            throw "Remote Desktop Services is not running."
+      - name: Find Roblox
+        shell: powershell
+        run: |
+          $possiblePaths = @(
+              "$env:LOCALAPPDATA\Roblox\Versions",
+              "$env:ProgramFiles\Roblox",
+              "${env:ProgramFiles(x86)}\Roblox"
+          )
+
+          $found = $false
+
+          foreach ($path in $possiblePaths) {
+              if (Test-Path $path) {
+                  $files = Get-ChildItem -Path $path -Recurse -Filter "RobloxPlayerBeta.exe" -ErrorAction SilentlyContinue
+                  foreach ($file in $files) {
+                      Write-Host "Roblox encontrado: $($file.FullName)"
+                      "ROBLOX_EXE=$($file.FullName)" >> $env:GITHUB_ENV
+                      $found = $true
+                  }
+              }
           }
 
+          if (-not $found) {
+              Write-Warning "RobloxPlayerBeta.exe não foi encontrado."
+          }
+
+      - name: Configure Roblox Auto Start
+        shell: powershell
+        run: |
+          if (-not $env:ROBLOX_EXE) {
+              Write-Warning "Executável do Roblox não encontrado."
+              exit 0
+          }
+
+          $action = New-ScheduledTaskAction -Execute $env:ROBLOX_EXE
+          $trigger = New-ScheduledTaskTrigger -AtLogOn -User "RDP"
+          $principal = New-ScheduledTaskPrincipal -UserId "RDP" -LogonType Interactive -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+          Register-ScheduledTask -TaskName "Start Roblox" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+
+      - name: Try Start Roblox
+        shell: powershell
+        run: |
+          if ($env:ROBLOX_EXE) {
+              try {
+                  Start-Process -FilePath $env:ROBLOX_EXE -ErrorAction Stop
+                  Write-Host "Roblox iniciado."
+              } catch {
+                  Write-Warning "Não foi possível iniciar o Roblox diretamente."
+                  Write-Warning $_
+              }
+          } else {
+              Write-Warning "Executável do Roblox não encontrado."
+          }
+
+      - name: RDP Information
+        shell: powershell
+        run: |
           Write-Host ""
-          Write-Host "========== TITAN CLOUD PC READY =========="
-          Write-Host "PC name      : titan-cloud-pc"
-          Write-Host "Tailscale IP : $ip"
-          Write-Host "RDP username : $username"
-          Write-Host "RDP port     : 3389"
-          Write-Host "RDP password : use your RDP_PASSWORD secret"
-          Write-Host "=========================================="
-          Write-Host "On the phone, connect Tailscale to the same authorized tailnet first."
-          Write-Host "Then open a compatible RDP client and enter the IP, username and password."
-          Write-Host "Do not share logs or secrets publicly."
+          Write-Host "=============================================="
+          Write-Host "              RDP DISPONÍVEL"
+          Write-Host "=============================================="
+          Write-Host "Endereço: $env:TAILSCALE_IP"
+          Write-Host "Usuário: $env:RDP_USERNAME"
+          Write-Host "Senha: $env:RDP_PASSWORD"
+          Write-Host "Porta: 3389"
+          Write-Host "=============================================="
 
-          # Keep the temporary GitHub-hosted runner active until timeout.
+      - name: Keep RDP Alive
+        shell: powershell
+        run: |
           while ($true) {
-            Start-Sleep -Seconds 60
+              Write-Host "[$(Get-Date)] RDP + Tailscale ativos..."
+              Start-Sleep -Seconds 300
           }
-'''
-p = Path("/mnt/data/Titan-Cloud-PC-Mobile.txt")
-p.write_text(content, encoding="utf-8")
-print(f"Arquivo TXT completo criado: {p}")
